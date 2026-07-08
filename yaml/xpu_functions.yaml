@@ -699,6 +699,7 @@ supported:
   - nll_loss2d_backward
   - linalg_cross
   - linalg_cross.out
+  - linalg_lstsq.out
   - copysign.out
   - copysign.Tensor
   - copysign_.Tensor
