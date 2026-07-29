@@ -4229,6 +4229,29 @@ class TestLinalg(TestCase):
             run_test(shape)
 
     @skipCPUIfNoLapack
+    @dtypes(torch.float)
+    def test_polar_cpu_xpu(self, device, dtype):
+        if torch.device(device).type != "xpu":
+            self.skipTest("XPU-only parity test")
+
+        A_cpu = make_tensor((16, 8), device="cpu", dtype=dtype, low=-2, high=2)
+        U_cpu, H_cpu = torch.linalg.polar(A_cpu)
+
+        prev_fallback = os.environ.get("PYTORCH_ENABLE_XPU_FALLBACK")
+        os.environ["PYTORCH_ENABLE_XPU_FALLBACK"] = "0"
+        try:
+            A_xpu = A_cpu.to(device="xpu")
+            U_xpu, H_xpu = torch.linalg.polar(A_xpu)
+        finally:
+            if prev_fallback is None:
+                os.environ.pop("PYTORCH_ENABLE_XPU_FALLBACK", None)
+            else:
+                os.environ["PYTORCH_ENABLE_XPU_FALLBACK"] = prev_fallback
+
+        self.assertEqual(U_xpu.cpu(), U_cpu, atol=1e-4, rtol=1e-4)
+        self.assertEqual(H_xpu.cpu(), H_cpu, atol=1e-4, rtol=1e-4)
+
+    @skipCPUIfNoLapack
     @skipCUDAIfNoCusolver
     @dtypes(torch.float, torch.double)
     def test_polar_ill_conditioned(self, device, dtype):
