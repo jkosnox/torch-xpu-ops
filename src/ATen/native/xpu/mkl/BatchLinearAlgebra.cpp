@@ -373,48 +373,6 @@ void lu_solve_mkl(
 }
 
 template <typename scalar_t>
-int64_t mkl_geqrf_batch_scratchpad(
-    sycl::queue& queue,
-    int64_t m,
-    int64_t n,
-    int64_t lda,
-    int64_t stride_a,
-    int64_t stride_tau,
-    int64_t batch_size) {
-  return oneapi::mkl::lapack::geqrf_batch_scratchpad_size<scalar_t>(
-      queue, m, n, lda, stride_a, stride_tau, batch_size);
-}
-
-template <typename scalar_t>
-void mkl_geqrf_batch(
-    sycl::queue& queue,
-    int64_t m,
-    int64_t n,
-    scalar_t* a,
-    int64_t lda,
-    int64_t stride_a,
-    scalar_t* tau,
-    int64_t stride_tau,
-    int64_t batch_size,
-    scalar_t* scratchpad,
-    int64_t scratchpad_size) {
-  SYCL_ONEMKL_SUBMIT(
-      queue,
-      oneapi::mkl::lapack::geqrf_batch,
-      queue,
-      m,
-      n,
-      a,
-      lda,
-      stride_a,
-      tau,
-      stride_tau,
-      batch_size,
-      scratchpad,
-      scratchpad_size);
-}
-
-template <typename scalar_t>
 void geqrf_mkl(const Tensor& A, const Tensor& tau) {
   if (A.numel() == 0) {
     return;
@@ -431,22 +389,47 @@ void geqrf_mkl(const Tensor& A, const Tensor& tau) {
   auto* a_data = reinterpret_cast<scalar_t*>(A.data_ptr());
   auto* tau_data = reinterpret_cast<scalar_t*>(tau.data_ptr());
 
-  const int64_t scratchpad_size = mkl_geqrf_batch_scratchpad<scalar_t>(
-      queue, m, n, lda, stride_a, stride_tau, batch_size);
-  Tensor scratchpad_at = at::empty({scratchpad_size}, A.options());
+  // Same batched vs looped dispatch as CUDA's geqrf_kernel: oneMKL's batched
+  // geqrf is only fast for many small matrices.
+  if (m <= 256 && batch_size >= std::max<int64_t>(2, m / 16)) {
+    const int64_t scratchpad_size =
+        oneapi::mkl::lapack::geqrf_batch_scratchpad_size<scalar_t>(
+            queue, m, n, lda, stride_a, stride_tau, batch_size);
+    Tensor scratchpad_at = at::empty({scratchpad_size}, A.options());
+    SYCL_ONEMKL_SUBMIT(
+        queue,
+        oneapi::mkl::lapack::geqrf_batch,
+        queue,
+        m,
+        n,
+        a_data,
+        lda,
+        stride_a,
+        tau_data,
+        stride_tau,
+        batch_size,
+        reinterpret_cast<scalar_t*>(scratchpad_at.data_ptr()),
+        scratchpad_size);
+    return;
+  }
 
-  mkl_geqrf_batch<scalar_t>(
-      queue,
-      m,
-      n,
-      a_data,
-      lda,
-      stride_a,
-      tau_data,
-      stride_tau,
-      batch_size,
-      reinterpret_cast<scalar_t*>(scratchpad_at.data_ptr()),
-      scratchpad_size);
+  const int64_t scratchpad_size =
+      oneapi::mkl::lapack::geqrf_scratchpad_size<scalar_t>(queue, m, n, lda);
+  Tensor scratchpad_at = at::empty({scratchpad_size}, A.options());
+  auto* scratchpad = reinterpret_cast<scalar_t*>(scratchpad_at.data_ptr());
+  for (const auto i : c10::irange(batch_size)) {
+    SYCL_ONEMKL_SUBMIT(
+        queue,
+        oneapi::mkl::lapack::geqrf,
+        queue,
+        m,
+        n,
+        &a_data[i * stride_a],
+        lda,
+        &tau_data[i * stride_tau],
+        scratchpad,
+        scratchpad_size);
+  }
 }
 
 template <typename scalar_t>
@@ -600,6 +583,51 @@ void apply_q_mkl(
   }
 }
 
+template <typename scalar_t>
+void gels_batch_mkl(const Tensor& A, const Tensor& B) {
+  // gels overwrites A, and its batch must match B's.
+  IntArrayRef A_batch_sizes(A.sizes().data(), A.dim() - 2);
+  IntArrayRef B_batch_sizes(B.sizes().data(), B.dim() - 2);
+  auto expand_batch_portion = at::infer_size(A_batch_sizes, B_batch_sizes);
+  expand_batch_portion.insert(
+      expand_batch_portion.end(), {A.size(-2), A.size(-1)});
+  Tensor A_broadcasted =
+      cloneBatchedColumnMajor(A.expand(expand_batch_portion));
+
+  auto& queue = at::xpu::getCurrentSYCLQueue();
+  const auto trans = oneapi::mkl::transpose::nontrans;
+  const int64_t m = A_broadcasted.size(-2);
+  const int64_t n = A_broadcasted.size(-1);
+  const int64_t nrhs = B.size(-1);
+  const int64_t lda = std::max<int64_t>(1, m);
+  const int64_t ldb = std::max<int64_t>(1, B.size(-2));
+  const int64_t stride_a = matrixStride(A_broadcasted);
+  const int64_t stride_b = matrixStride(B);
+  const int64_t batch_size = batchCount(B);
+
+  const int64_t scratchpad_size =
+      oneapi::mkl::lapack::gels_batch_scratchpad_size<scalar_t>(
+          queue, trans, m, n, nrhs, lda, stride_a, ldb, stride_b, batch_size);
+  Tensor scratchpad_at = at::empty({scratchpad_size}, B.options());
+  SYCL_ONEMKL_SUBMIT(
+      queue,
+      oneapi::mkl::lapack::gels_batch,
+      queue,
+      trans,
+      m,
+      n,
+      nrhs,
+      reinterpret_cast<scalar_t*>(A_broadcasted.data_ptr()),
+      lda,
+      stride_a,
+      reinterpret_cast<scalar_t*>(B.data_ptr()),
+      ldb,
+      stride_b,
+      batch_size,
+      reinterpret_cast<scalar_t*>(scratchpad_at.data_ptr()),
+      scratchpad_size);
+}
+
 void linalg_lstsq_gels_mkl(const Tensor& A, const Tensor& B) {
   const auto m = A.size(-2);
   const auto n = A.size(-1);
@@ -618,6 +646,30 @@ void linalg_lstsq_gels_mkl(const Tensor& A, const Tensor& B) {
   AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(
       A.scalar_type(), "linalg_lstsq_gels_mkl", [&] {
         using mkl_t = get_mkl_type<scalar_t>::type;
+
+        // Same batched vs looped dispatch as CUDA's lstsq_kernel. oneMKL's
+        // gels_batch does not support m < n, and returns wrong solutions for
+        // complex square matrices.
+        if ((m > n || (m == n && !A.is_complex())) && m <= 256 &&
+            batchCount(B) >= std::max<int64_t>(2, m / 16)) {
+          if (m == n) {
+            gels_batch_mkl<mkl_t>(A, B);
+            return;
+          }
+          // Unlike LAPACK, oneMKL's gels_batch does not leave Q^H B in rows
+          // n:m of B, which linalg_lstsq reads to compute the residuals. Put
+          // the residual norm in row n and zeros below it instead.
+          Tensor B_orig = B.clone();
+          gels_batch_mkl<mkl_t>(A, B);
+          Tensor residual_norm = at::linalg_vector_norm(
+              at::matmul(A, B.narrow(-2, 0, n)) - B_orig,
+              2,
+              IntArrayRef{-2},
+              /*keepdim=*/true);
+          B.narrow(-2, n + 1, m - n - 1).zero_();
+          B.narrow(-2, n, 1).copy_(residual_norm);
+          return;
+        }
 
         if (m >= n) {
           geqrf_mkl<mkl_t>(A, tau);
